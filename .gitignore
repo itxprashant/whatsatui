@@ -1,0 +1,20 @@
+# Gateway credentials and local overrides (never commit)
+.env
+
+# WhatsApp gateway persistent data: sessions, message DBs, downloaded media
+storages/
+statics/
+
+# Rust build output
+/target/
+
+# Local caches (group-name cache lives under ~/.cache/whatsatui by default)
+.cache/
+
+# Editor and OS noise
+.DS_Store
+Thumbs.db
+*.swp
+*~
+.idea/
+.vscode/

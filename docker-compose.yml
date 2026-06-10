@@ -1,0 +1,16 @@
+services:
+  whatsapp_go:
+    image: aldinokemal2104/go-whatsapp-web-multidevice:latest
+    container_name: go-whatsapp-web-multidevice
+    logging:
+      driver: json-file
+      options:
+        max-size: 200k
+        max-file: "10"
+    restart: unless-stopped
+    network_mode: host
+    env_file:
+      - .env
+    volumes:
+      - ./storages:/app/storages
+      - ./statics:/app/statics
