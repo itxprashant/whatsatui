@@ -2,14 +2,19 @@ use std::time::Duration;
 
 use anyhow::Result;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use ratatui::layout::Rect;
 use ratatui::DefaultTerminal;
+use ratatui_image::picker::Picker;
+use ratatui_image::Resize;
 use tokio::sync::mpsc::{self, UnboundedSender};
 
 use whatsatui::api::ApiClient;
 use whatsatui::app::{App, AppEvent, Focus, ImageView, MESSAGES_PAGE};
 use whatsatui::media::{self, MediaRow};
 use whatsatui::termimg;
+use whatsatui::terminal;
 use whatsatui::archive;
+use whatsatui::contacts_db;
 use whatsatui::config::Config;
 use whatsatui::{ui, webhook};
 
@@ -35,6 +40,12 @@ async fn main() -> Result<()> {
 async fn run(terminal: &mut DefaultTerminal, client: ApiClient, cfg: Config) -> Result<()> {
     let (tx, mut rx) = mpsc::unbounded_channel::<AppEvent>();
     let mut app = App::new();
+    let caps = terminal::probe_terminal_picker();
+    app.set_terminal_images(
+        caps.picker,
+        caps.native_images,
+        caps.native_inline_images,
+    );
 
     // Blocking terminal-input reader on its own OS thread.
     {
@@ -74,7 +85,7 @@ async fn run(terminal: &mut DefaultTerminal, client: ApiClient, cfg: Config) -> 
     spawn_contacts(&client, &tx);
     spawn_groups(&client, &tx);
 
-    terminal.draw(|f| ui::draw(f, &app))?;
+    terminal.draw(|f| ui::draw(f, &mut app))?;
 
     while let Some(ev) = rx.recv().await {
         match ev {
@@ -91,9 +102,10 @@ async fn run(terminal: &mut DefaultTerminal, client: ApiClient, cfg: Config) -> 
                 chats,
                 generation,
                 show_archived,
+                push_names,
             } => {
                 let had_open = app.current_jid.is_some();
-                app.set_chats(chats, generation, show_archived);
+                app.set_chats(chats, generation, show_archived, push_names);
                 let jids: Vec<String> = app
                     .visible_chat_indices()
                     .into_iter()
@@ -141,16 +153,28 @@ async fn run(terminal: &mut DefaultTerminal, client: ApiClient, cfg: Config) -> 
                 event,
                 chat_id,
                 is_from_me: _,
-            } => handle_webhook(&mut app, &client, &tx, &cfg, &event, chat_id),
+                ack_ids,
+                ack_level,
+            } => handle_webhook(
+                &mut app,
+                &client,
+                &tx,
+                &cfg,
+                &event,
+                chat_id,
+                ack_ids,
+                ack_level,
+            ),
             AppEvent::ImageReady { message_id, view } => {
                 app.set_image_view(message_id, view);
             }
             AppEvent::ImageFailed { message_id, error } => {
                 app.image_view_failed(message_id, error);
             }
-            AppEvent::ThumbnailReady { message_id, image } => {
-                app.set_message_thumbnail(message_id, image);
-            }
+            AppEvent::ThumbnailReady {
+                message_id,
+                protocol,
+            } => app.set_image_protocol(message_id, protocol),
             AppEvent::ThumbnailFailed { message_id } => {
                 app.thumbnail_fetch_done(&message_id);
             }
@@ -166,10 +190,23 @@ async fn run(terminal: &mut DefaultTerminal, client: ApiClient, cfg: Config) -> 
         if app.should_quit {
             break;
         }
-        terminal.draw(|f| ui::draw(f, &app))?;
+        terminal.draw(|f| ui::draw(f, &mut app))?;
     }
 
     Ok(())
+}
+
+/// Switch the open conversation when `j`/`k` moves the chat-list selection.
+fn open_selected_chat_if_changed(app: &mut App, client: &ApiClient, tx: &Tx) {
+    let Some(jid) = app.selected_jid() else {
+        return;
+    };
+    if app.current_jid.as_deref() == Some(jid.as_str()) {
+        return;
+    }
+    app.open_jid(jid.clone());
+    let gen = app.next_messages_generation();
+    spawn_messages(client, tx, jid, gen);
 }
 
 fn handle_input(app: &mut App, input: Event, client: &ApiClient, tx: &Tx, cfg: &Config) {
@@ -195,8 +232,14 @@ fn handle_input(app: &mut App, input: Event, client: &ApiClient, tx: &Tx, cfg: &
     match app.focus {
         Focus::Chats => match key.code {
             KeyCode::Char('q') => app.should_quit = true,
-            KeyCode::Char('j') | KeyCode::Down => app.select_next(),
-            KeyCode::Char('k') | KeyCode::Up => app.select_prev(),
+            KeyCode::Char('j') | KeyCode::Down => {
+                app.select_next();
+                open_selected_chat_if_changed(app, client, tx);
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                app.select_prev();
+                open_selected_chat_if_changed(app, client, tx);
+            }
             KeyCode::Char('/') => app.enter_search(),
             KeyCode::Char('a') => {
                 app.toggle_archived();
@@ -218,6 +261,7 @@ fn handle_input(app: &mut App, input: Event, client: &ApiClient, tx: &Tx, cfg: &
             KeyCode::Char('i') | KeyCode::Tab => {
                 if app.current_jid.is_some() {
                     app.focus = Focus::Compose;
+                    app.compose_cursor_end();
                 }
             }
             KeyCode::Char('r') => {
@@ -243,11 +287,15 @@ fn handle_input(app: &mut App, input: Event, client: &ApiClient, tx: &Tx, cfg: &
             }
             KeyCode::PageDown | KeyCode::End => handle_message_scroll_down(app, key.code),
             KeyCode::Char('v') if app.current_jid.is_some() => {
-                if let (Some(jid), Some(msg)) =
-                    (app.current_jid.clone(), app.picked_media_message().cloned())
-                {
+                if !app.native_images {
+                    app.status = terminal::unsupported_images_hint().to_string();
+                } else if let (Some(jid), Some(msg), Some(picker)) = (
+                    app.current_jid.clone(),
+                    app.picked_media_message().cloned(),
+                    app.picker.clone(),
+                ) {
                     app.begin_image_view(msg.id.clone());
-                    spawn_image_view(&client, tx, cfg, jid, msg);
+                    spawn_image_view(&client, tx, cfg, jid, msg, picker);
                 } else {
                     app.status = "No image in this chat".to_string();
                 }
@@ -285,6 +333,9 @@ fn handle_input(app: &mut App, input: Event, client: &ApiClient, tx: &Tx, cfg: &
         Focus::ImageViewer => {}
         Focus::Compose => match key.code {
             KeyCode::Esc | KeyCode::Tab => app.focus = Focus::Chats,
+            KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                app.insert_compose_char('\n');
+            }
             KeyCode::Enter => {
                 let text = app.compose.trim().to_string();
                 if !text.is_empty() {
@@ -297,14 +348,16 @@ fn handle_input(app: &mut App, input: Event, client: &ApiClient, tx: &Tx, cfg: &
                         app.append_outgoing(text.clone(), &sender);
                         app.status = "Sending…".to_string();
                         spawn_send(client, tx, jid, text);
-                        app.compose.clear();
+                        app.clear_compose();
                     }
                 }
             }
-            KeyCode::Backspace => {
-                app.compose.pop();
-            }
-            KeyCode::Char(c) => app.compose.push(c),
+            KeyCode::Backspace => app.delete_compose_before_cursor(),
+            KeyCode::Left => app.move_compose_cursor(-1),
+            KeyCode::Right => app.move_compose_cursor(1),
+            KeyCode::Home => app.compose_cursor_home(),
+            KeyCode::End => app.compose_cursor_end(),
+            KeyCode::Char(c) => app.insert_compose_char(c),
             _ => {}
         },
     }
@@ -335,9 +388,18 @@ fn handle_webhook(
     cfg: &Config,
     event: &str,
     chat_id: Option<String>,
+    ack_ids: Vec<String>,
+    ack_level: Option<whatsatui::api::AckLevel>,
 ) {
     // Only message-related events affect what we render.
     if !event.starts_with("message") {
+        return;
+    }
+
+    if event == "message.ack" {
+        if let Some(level) = ack_level {
+            app.apply_message_ack(&ack_ids, level);
+        }
         return;
     }
 
@@ -460,12 +522,18 @@ fn spawn_groups(client: &ApiClient, tx: &Tx) {
 const THUMBNAIL_BATCH: usize = 8;
 
 fn maybe_spawn_thumbnails(app: &mut App, client: &ApiClient, tx: &Tx, cfg: &Config) {
+    if !app.native_inline_images {
+        return;
+    }
     let Some(jid) = app.current_jid.clone() else {
+        return;
+    };
+    let Some(picker) = app.picker.clone() else {
         return;
     };
     for msg in app.messages_needing_thumbnails(THUMBNAIL_BATCH) {
         app.mark_thumbnail_pending(&msg.id);
-        spawn_message_thumbnail(client, tx, cfg, jid.clone(), msg);
+        spawn_message_thumbnail(client, tx, cfg, jid.clone(), msg, picker.clone());
     }
 }
 
@@ -475,6 +543,7 @@ fn spawn_message_thumbnail(
     cfg: &Config,
     chat_jid: String,
     message: whatsatui::api::Message,
+    picker: Picker,
 ) {
     let client = client.clone();
     let tx = tx.clone();
@@ -485,17 +554,33 @@ fn spawn_message_thumbnail(
             let row = media_row_for_message(&db_path, &message_id, &chat_jid, &message)?;
             let http = media_http_client()?;
             let bytes = media::download_decrypted(&http, &row).await?;
-            let img = termimg::decode_image(&bytes)?;
-            Ok::<_, anyhow::Error>(termimg::thumbnail_image(&img))
+            termimg::decode_image(&bytes).map_err(anyhow::Error::from)
         }
         .await;
 
         match result {
-            Ok(thumb) => {
-                let _ = tx.send(AppEvent::ThumbnailReady {
-                    message_id,
-                    image: thumb,
-                });
+            Ok(img) => {
+                let size = Rect::new(
+                    0,
+                    0,
+                    termimg::INLINE_PREVIEW_COLS,
+                    termimg::INLINE_PREVIEW_ROWS,
+                );
+                let encoded = std::thread::spawn(move || {
+                    picker.new_protocol(img, size, Resize::Fit(None))
+                })
+                .join();
+                match encoded {
+                    Ok(Ok(protocol)) => {
+                        let _ = tx.send(AppEvent::ThumbnailReady {
+                            message_id,
+                            protocol,
+                        });
+                    }
+                    _ => {
+                        let _ = tx.send(AppEvent::ThumbnailFailed { message_id });
+                    }
+                }
             }
             Err(_) => {
                 let _ = tx.send(AppEvent::ThumbnailFailed { message_id });
@@ -511,6 +596,7 @@ fn spawn_image_view(
     cfg: &Config,
     chat_jid: String,
     message: whatsatui::api::Message,
+    picker: Picker,
 ) {
     let client = client.clone();
     let tx = tx.clone();
@@ -529,10 +615,20 @@ fn spawn_image_view(
 
         match result {
             Ok((image, caption)) => {
-                let _ = tx.send(AppEvent::ImageReady {
-                    message_id,
-                    view: ImageView { image, caption },
-                });
+                let protocol = std::thread::spawn(move || picker.new_resize_protocol(image))
+                    .join()
+                    .ok();
+                if let Some(protocol) = protocol {
+                    let _ = tx.send(AppEvent::ImageReady {
+                        message_id,
+                        view: ImageView { protocol, caption },
+                    });
+                } else {
+                    let _ = tx.send(AppEvent::ImageFailed {
+                        message_id,
+                        error: "Image: encode failed".to_string(),
+                    });
+                }
             }
             Err(e) => {
                 let _ = tx.send(AppEvent::ImageFailed {
@@ -602,6 +698,7 @@ fn spawn_chats(
     tokio::spawn(async move {
         let db_path = std::path::Path::new(&whatsmeow_db);
         let archived_jids = archive::load_archived_jids(db_path);
+        let push_names = contacts_db::load_push_names(db_path);
 
         let result = if show_archived {
             client.list_all_chats().await.map(|chats| {
@@ -626,6 +723,7 @@ fn spawn_chats(
                     chats,
                     generation,
                     show_archived,
+                    push_names: push_names.clone(),
                 });
             }
             Err(e) => {

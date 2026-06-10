@@ -49,6 +49,33 @@ pub struct Chat {
 /// Prefix for client-side optimistic messages not yet confirmed by the API.
 pub const PENDING_MSG_PREFIX: &str = "pending:";
 
+/// Outgoing delivery/read state tracked client-side (REST has no ack field).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum AckLevel {
+    Pending,
+    Sent,
+    Delivered,
+    Read,
+}
+
+impl AckLevel {
+    pub fn from_receipt_type(s: &str) -> Option<Self> {
+        match s {
+            "delivered" => Some(Self::Delivered),
+            "read" => Some(Self::Read),
+            _ => None,
+        }
+    }
+
+    pub fn display_ticks(self) -> &'static str {
+        match self {
+            Self::Pending => "◷",
+            Self::Sent => "✓",
+            Self::Delivered | Self::Read => "✓✓",
+        }
+    }
+}
+
 /// A single message inside a chat as returned by `GET /chat/{jid}/messages`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Message {
@@ -358,5 +385,23 @@ mod tests {
     fn video_note_label() {
         let m = msg("", "video_note", "vn.mp4");
         assert_eq!(m.body_for_display(), "[video]");
+    }
+
+    #[test]
+    fn ack_from_receipt_type() {
+        assert_eq!(
+            AckLevel::from_receipt_type("delivered"),
+            Some(AckLevel::Delivered)
+        );
+        assert_eq!(AckLevel::from_receipt_type("read"), Some(AckLevel::Read));
+        assert!(AckLevel::from_receipt_type("played").is_none());
+    }
+
+    #[test]
+    fn ack_display_ticks() {
+        assert_eq!(AckLevel::Pending.display_ticks(), "◷");
+        assert_eq!(AckLevel::Sent.display_ticks(), "✓");
+        assert_eq!(AckLevel::Delivered.display_ticks(), "✓✓");
+        assert_eq!(AckLevel::Read.display_ticks(), "✓✓");
     }
 }

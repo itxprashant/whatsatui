@@ -5,6 +5,7 @@ use serde::Deserialize;
 use sha2::Sha256;
 use tokio::sync::mpsc::UnboundedSender;
 
+use crate::api::AckLevel;
 use crate::app::AppEvent;
 use crate::config::Config;
 
@@ -25,6 +26,10 @@ struct WebhookPayload {
     chat_id: String,
     #[serde(default)]
     is_from_me: bool,
+    #[serde(default)]
+    ids: Vec<String>,
+    #[serde(default)]
+    receipt_type: String,
 }
 
 /// Verify the gateway's `X-Hub-Signature-256` header against the raw body.
@@ -85,10 +90,13 @@ pub fn spawn(cfg: &Config, tx: UnboundedSender<AppEvent>) -> std::io::Result<()>
                 } else {
                     Some(env.payload.chat_id)
                 };
+                let ack_level = AckLevel::from_receipt_type(&env.payload.receipt_type);
                 let _ = tx.send(AppEvent::Webhook {
                     event: env.event,
                     chat_id,
                     is_from_me: env.payload.is_from_me,
+                    ack_ids: env.payload.ids,
+                    ack_level,
                 });
             }
 
@@ -134,5 +142,25 @@ mod tests {
     #[test]
     fn rejects_garbage_header() {
         assert!(!verify_signature(SECRET, BODY, "not-hex"));
+    }
+
+    #[test]
+    fn parses_message_ack_payload() {
+        let body = br#"{
+            "event": "message.ack",
+            "payload": {
+                "ids": ["3EB00106E8BE0F407E88EC"],
+                "chat_id": "120363402106XXXXX@g.us",
+                "receipt_type": "delivered"
+            }
+        }"#;
+        let env: WebhookEnvelope = serde_json::from_slice(body).unwrap();
+        assert_eq!(env.event, "message.ack");
+        assert_eq!(env.payload.ids, vec!["3EB00106E8BE0F407E88EC"]);
+        assert_eq!(env.payload.receipt_type, "delivered");
+        assert_eq!(
+            AckLevel::from_receipt_type(&env.payload.receipt_type),
+            Some(AckLevel::Delivered)
+        );
     }
 }

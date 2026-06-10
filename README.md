@@ -6,19 +6,21 @@ gateway over its REST API.
 
 ```
 ┌ whatsatui · <device> ─────────────────────────── ● online ┐
+│──────────────────────────────────────────────────────────│
 │ Chats            │  <chat name>                            │
-│ ▎ A  Alice   2m  │   incoming bubble                       │
-│   B  Bob     1h  │                          outgoing ✓     │
-│   C  Carol   Mon │   [inline image preview]                │
+│ ▎ A  Alice   2m  │        ────────── Today ──────────      │
+│   B  Bob     1h  │   incoming bubble                       │
+│   C  Carol   Mon │                          outgoing ✓✓    │
+│                  │   [inline image preview]                │
 │                  ├─ Message ──────────────────────────────┤
 │                  │ Type a message…                        │
 └──────────────────┴─────────────────────────────────────────┘
- j/k move   enter open   i compose   r refresh   q quit
+ j/k chat   [/] image   v view   PgUp/Dn scroll   i compose   q quit
 ```
 
 ## Prerequisites
 
-- **Rust** (stable) and Cargo — [rustup.rs](https://rustup.rs)
+- **Rust** 1.86+ (stable) and Cargo — [rustup.rs](https://rustup.rs)
 - **Docker** and **Docker Compose** — to run the bundled WhatsApp gateway
 - A terminal (TTY) for the interactive TUI
 
@@ -164,6 +166,8 @@ whatsatui reads **environment variables** (defaults match the bundled gateway):
 | `WHATSATUI_WHATSMEOW_DB`   | `storages/whatsapp.db`   | Gateway whatsmeow DB (archived chats)         |
 | `WHATSATUI_CHATSTORAGE_DB` | `storages/chatstorage.db`| Gateway chatstorage DB (media keys)           |
 | `WHATSATUI_CACHE_DIR`      | `~/.cache/whatsatui`     | On-disk cache for group subjects              |
+| `WHATSATUI_INLINE_IMAGES`  | _(unset = on)_           | Set to `0` to disable inline bubble previews (e.g. Konsole scroll artifacts) |
+| `WHATSATUI_IMAGE_PROTOCOL` | _(unset)_                | Force protocol: `sixel`, `kitty`, or `iterm2` |
 
 If only one device is linked on the gateway, `WHATSATUI_DEVICE_ID` can stay unset.
 
@@ -235,18 +239,26 @@ cargo run --example webhook_check
 |-----------|------------------------------|
 | _typing_  | Edit the message             |
 | `Enter`   | Send the message             |
+| `Shift+Enter` | Insert a newline         |
+| `←` / `→` / `Home` / `End` | Move cursor   |
 | `Esc` / `Tab` | Return focus to chat list |
 
 ## Features
 
 - Chat list with avatar-style badges, relative timestamps, and last-message previews.
 - Search/filter chats (`/`), toggle archived (`a`), scroll history (`PgUp`/`PgDn`) and load older messages.
-- Media labels (`[image]`, `[video]`, `[file: …]`, captions) with **inline image thumbnails** in bubbles.
-- Full-screen in-terminal image viewer (`v`) using braille rendering; images decrypted locally from gateway media keys.
+- Media labels (`[image]`, `[video]`, `[file: …]`, captions) with **inline image
+  previews** in bubbles on graphics-capable terminals (Kitty, Konsole with Sixel,
+  iTerm2, Ghostty, etc.) via [ratatui-image](https://crates.io/crates/ratatui-image).
+  Set `WHATSATUI_INLINE_IMAGES=0` if Konsole shows scroll artifacts.
+- Full-screen image viewer (`v`) on Konsole and other graphics-capable terminals;
+  images decrypted locally from gateway media keys.
 - Contact and group names resolved from the gateway (address book and
   `/user/my/groups`; chat-list `Group <id>` placeholders are ignored).
-- Conversation view with chat-bubble styling (outgoing right / incoming left).
-- Send text messages to the open chat.
+- Conversation view with chat-bubble styling (outgoing right / incoming left),
+  day separators, and delivery ticks (`◷` pending, `✓` sent, `✓✓` delivered/read
+  via `message.ack` webhooks).
+- Send text messages to the open chat (multiline with `Shift+Enter`).
 - Live updates: incoming messages refresh the open conversation and reorder the
   chat list via the local webhook receiver (selection preserved).
 - Non-blocking async networking: the UI stays responsive while data loads,
@@ -264,7 +276,7 @@ cargo run --example webhook_check
 | `src/config.rs`   | Environment-based configuration                       |
 | `src/archive.rs`  | Archived chats from whatsmeow DB                      |
 | `src/media.rs`    | WhatsApp CDN download + decrypt                       |
-| `src/termimg.rs`  | Braille terminal image rendering                      |
+| `src/termimg.rs`  | Image decode + inline preview dimensions              |
 | `src/cache.rs`    | On-disk group-name cache                              |
 | `src/webhook.rs`  | Local HTTP receiver + HMAC-SHA256 verifier            |
 | `docker-compose.yml` | Bundled `go-whatsapp-web-multidevice` gateway      |
@@ -279,6 +291,8 @@ cargo run --example webhook_check
 | No live updates | `WHATSAPP_WEBHOOK` points to `http://localhost:56311/webhook`; secrets match; recreate container. Port 56311 free? |
 | Archived list wrong | `WHATSATUI_WHATSMEOW_DB` points at `./storages/whatsapp.db` (not chatstorage). |
 | Images don't load | `WHATSAPP_CHAT_STORAGE=true` in `.env`; `storages/chatstorage.db` exists after linking. |
+| Only `[image]` in bubbles | Enable *Settings → General → Use Sixel graphics* in Konsole; ensure `WHATSATUI_INLINE_IMAGES` is not `0`. |
+| Rogue blocks / misplaced images when scrolling | Konsole Sixel + scroll; set `WHATSATUI_INLINE_IMAGES=0` and use **`v`** for fullscreen, or try Kitty/iTerm2. |
 | TUI won't start in CI | Needs a real TTY; use `cargo run --example probe` instead. |
 
 **Do not delete** `storages/` or `statics/` unless you intend to wipe the linked

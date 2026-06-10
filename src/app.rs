@@ -1,9 +1,11 @@
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
-use image::{DynamicImage, GenericImageView};
+use ratatui::widgets::ListState;
+use ratatui_image::picker::Picker;
+use ratatui_image::protocol::{Protocol, StatefulProtocol};
 
-use crate::api::{Chat, Contact, Device, Group, Message};
+use crate::api::{AckLevel, Chat, Contact, Device, Group, Message};
 use crate::cache;
 
 /// Which pane currently has keyboard focus.
@@ -15,23 +17,13 @@ pub enum Focus {
     ImageViewer,
 }
 
-/// Decoded image shown in the in-terminal viewer overlay.
+/// Native terminal image shown in the full-screen viewer overlay.
 pub struct ImageView {
-    pub image: DynamicImage,
+    pub protocol: StatefulProtocol,
     pub caption: String,
 }
 
-impl std::fmt::Debug for ImageView {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ImageView")
-            .field("image", &self.image.dimensions())
-            .field("caption", &self.caption)
-            .finish()
-    }
-}
-
 /// Events delivered to the main loop from input and background network tasks.
-#[derive(Debug)]
 pub enum AppEvent {
     Input(ratatui::crossterm::event::Event),
     Tick,
@@ -40,6 +32,7 @@ pub enum AppEvent {
         chats: Vec<Chat>,
         generation: u64,
         show_archived: bool,
+        push_names: HashMap<String, String>,
     },
     Messages {
         jid: String,
@@ -67,6 +60,8 @@ pub enum AppEvent {
         event: String,
         chat_id: Option<String>,
         is_from_me: bool,
+        ack_ids: Vec<String>,
+        ack_level: Option<AckLevel>,
     },
     ImageReady {
         message_id: String,
@@ -78,7 +73,7 @@ pub enum AppEvent {
     },
     ThumbnailReady {
         message_id: String,
-        image: DynamicImage,
+        protocol: Protocol,
     },
     ThumbnailFailed {
         message_id: String,
@@ -100,7 +95,11 @@ pub struct App {
     pub device: Option<Device>,
     pub focus: Focus,
     pub compose: String,
+    /// Character index for the compose cursor (0 = start).
+    pub compose_cursor: usize,
     pub chat_filter: String,
+    /// Chat list selection + scroll; updated by the List widget each frame.
+    pub chat_list_state: ListState,
     pub show_archived: bool,
     pub status: String,
     pub loading_chats: bool,
@@ -119,6 +118,8 @@ pub struct App {
     pub should_quit: bool,
     /// Resolved contact names, keyed by jid.
     pub contacts: HashMap<String, String>,
+    /// Push/business names from whatsmeow_contacts (correct for business accounts).
+    pub push_names: HashMap<String, String>,
     /// Resolved group subjects, keyed by group jid.
     pub groups: HashMap<String, String>,
     /// Last-message preview per chat jid (from lazy fetches).
@@ -131,9 +132,17 @@ pub struct App {
     pub image_view: Option<ImageView>,
     /// Message id currently being fetched/rendered for the viewer.
     pub image_message_id: Option<String>,
-    /// Small inline previews keyed by message id.
-    pub message_thumbnails: HashMap<String, DynamicImage>,
+    /// Terminal graphics protocols for inline previews, keyed by message id.
+    pub image_protocols: HashMap<String, Protocol>,
     pub thumbnail_pending: HashSet<String>,
+    /// Terminal image capability probe (Kitty / iTerm2 / Sixel).
+    pub picker: Option<Picker>,
+    /// Full-screen image viewer (`v`).
+    pub native_images: bool,
+    /// Inline previews in scrollable message bubbles.
+    pub native_inline_images: bool,
+    /// Delivery/read ticks keyed by message id (from `message.ack` webhooks).
+    pub message_acks: HashMap<String, AckLevel>,
 }
 
 impl App {
@@ -146,7 +155,9 @@ impl App {
             device: None,
             focus: Focus::Chats,
             compose: String::new(),
+            compose_cursor: 0,
             chat_filter: String::new(),
+            chat_list_state: ListState::default().with_selected(Some(0)),
             show_archived: false,
             status: String::new(),
             loading_chats: false,
@@ -162,6 +173,7 @@ impl App {
             spinner: 0,
             should_quit: false,
             contacts: HashMap::new(),
+            push_names: HashMap::new(),
             groups: cache::load_group_names(),
             chat_previews: HashMap::new(),
             last_chat_refresh: None,
@@ -169,9 +181,24 @@ impl App {
             loading_image: false,
             image_view: None,
             image_message_id: None,
-            message_thumbnails: HashMap::new(),
+            image_protocols: HashMap::new(),
             thumbnail_pending: HashSet::new(),
+            picker: None,
+            native_images: false,
+            native_inline_images: false,
+            message_acks: HashMap::new(),
         }
+    }
+
+    pub fn set_terminal_images(
+        &mut self,
+        picker: Option<Picker>,
+        native_images: bool,
+        native_inline_images: bool,
+    ) {
+        self.picker = picker;
+        self.native_images = native_images;
+        self.native_inline_images = native_inline_images;
     }
 
     pub fn set_contacts(&mut self, contacts: Vec<Contact>) {
@@ -197,7 +224,7 @@ impl App {
 
     /// Resolve a display name for a chat. Groups: subject from `/user/my/groups`
     /// (the chat list often has placeholder `Group <id>` names). Individuals:
-    /// contact name -> chat name -> bare jid.
+    /// whatsmeow push/business name -> saved contact -> chat name -> bare jid.
     pub fn chat_display_name(&self, chat: &Chat) -> String {
         if is_group_jid(&chat.jid) {
             if let Some(name) = self.groups.get(&chat.jid) {
@@ -208,10 +235,13 @@ impl App {
             }
             return bare_jid(&chat.jid);
         }
+        if let Some(name) = self.push_name(&chat.jid) {
+            return name;
+        }
         if let Some(name) = self.contact_name(&chat.jid) {
             return name;
         }
-        if !chat.name.trim().is_empty() {
+        if self.is_usable_chat_name(&chat.jid, &chat.name) {
             return chat.name.clone();
         }
         bare_jid(&chat.jid)
@@ -219,7 +249,29 @@ impl App {
 
     /// Resolve a display name for an arbitrary jid (used for message senders).
     pub fn jid_display_name(&self, jid: &str) -> String {
-        self.contact_name(jid).unwrap_or_else(|| bare_jid(jid))
+        self.push_name(jid)
+            .or_else(|| self.contact_name(jid))
+            .unwrap_or_else(|| bare_jid(jid))
+    }
+
+    fn push_name(&self, jid: &str) -> Option<String> {
+        self.push_names.get(jid).cloned()
+    }
+
+    /// Chat list `name` is wrong when it echoes our own profile on a 1:1 peer chat.
+    fn is_usable_chat_name(&self, chat_jid: &str, name: &str) -> bool {
+        let name = name.trim();
+        if name.is_empty() {
+            return false;
+        }
+        if let Some(device) = &self.device {
+            if chat_jid != device.jid && !device.display_name.trim().is_empty() {
+                if name.eq_ignore_ascii_case(device.display_name.trim()) {
+                    return false;
+                }
+            }
+        }
+        true
     }
 
     fn contact_name(&self, jid: &str) -> Option<String> {
@@ -248,9 +300,79 @@ impl App {
         let n = self.visible_chat_indices().len();
         if n == 0 {
             self.selected = 0;
+            self.chat_list_state.select(None);
         } else if self.selected >= n {
             self.selected = n - 1;
+            self.chat_list_state.select(Some(self.selected));
+        } else {
+            self.chat_list_state.select(Some(self.selected));
         }
+    }
+
+    pub fn ack_for(&self, message: &Message) -> AckLevel {
+        if message.is_pending() {
+            return AckLevel::Pending;
+        }
+        if !message.is_from_me {
+            return AckLevel::Sent;
+        }
+        self.message_acks
+            .get(&message.id)
+            .copied()
+            .unwrap_or(AckLevel::Sent)
+    }
+
+    pub fn apply_message_ack(&mut self, ids: &[String], level: AckLevel) {
+        for id in ids {
+            let entry = self.message_acks.entry(id.clone()).or_insert(level);
+            if level > *entry {
+                *entry = level;
+            }
+        }
+    }
+
+    pub fn insert_compose_char(&mut self, c: char) {
+        let pos = self.compose_cursor.min(self.compose.chars().count());
+        let mut chars: Vec<char> = self.compose.chars().collect();
+        chars.insert(pos, c);
+        self.compose = chars.into_iter().collect();
+        self.compose_cursor = pos + 1;
+    }
+
+    pub fn delete_compose_before_cursor(&mut self) {
+        if self.compose_cursor == 0 {
+            return;
+        }
+        let pos = self.compose_cursor - 1;
+        let mut chars: Vec<char> = self.compose.chars().collect();
+        if pos < chars.len() {
+            chars.remove(pos);
+            self.compose = chars.into_iter().collect();
+            self.compose_cursor = pos;
+        }
+    }
+
+    pub fn move_compose_cursor(&mut self, delta: isize) {
+        let len = self.compose.chars().count();
+        let next = if delta.is_negative() {
+            self.compose_cursor.saturating_sub(delta.unsigned_abs() as usize)
+        } else {
+            (self.compose_cursor + delta as usize).min(len)
+        };
+        self.compose_cursor = next;
+    }
+
+    pub fn compose_cursor_home(&mut self) {
+        self.compose_cursor = 0;
+    }
+
+    pub fn compose_cursor_end(&mut self) {
+        self.compose_cursor = self.compose.chars().count();
+    }
+
+    pub fn clear_compose(&mut self) {
+        self.compose.clear();
+        self.compose_cursor = 0;
     }
 
     /// Whether enough time has passed since the last live chat-list refetch.
@@ -303,6 +425,7 @@ impl App {
         chats: Vec<Chat>,
         generation: u64,
         show_archived: bool,
+        push_names: HashMap<String, String>,
     ) {
         if generation < self.active_chats_generation {
             return;
@@ -315,6 +438,7 @@ impl App {
 
         let selected_jid = self.selected_jid();
         self.chats = chats;
+        self.push_names = push_names;
         self.loading_chats = false;
         if let Some(jid) = selected_jid {
             let visible = self.visible_chat_indices();
@@ -324,6 +448,7 @@ impl App {
                 .unwrap_or(0);
         }
         self.clamp_selection();
+        *self.chat_list_state.offset_mut() = 0;
         self.status = if self.show_archived {
             format!("{} archived chats", self.chats.len())
         } else {
@@ -367,7 +492,7 @@ impl App {
         self.loading_messages = false;
         self.msg_scroll_from_bottom = 0;
         self.sync_media_pick();
-        self.prune_message_thumbnails();
+        self.prune_message_media();
     }
 
     pub fn prepend_older_messages(
@@ -399,7 +524,7 @@ impl App {
         self.msg_scroll_from_bottom = self
             .msg_scroll_from_bottom
             .saturating_add((added as u16).saturating_mul(2));
-        self.prune_message_thumbnails();
+        self.prune_message_media();
     }
 
     pub fn scroll_messages_page_up(&mut self) {
@@ -446,11 +571,13 @@ impl App {
         let n = self.visible_chat_indices().len();
         if n > 0 {
             self.selected = (self.selected + 1).min(n - 1);
+            self.chat_list_state.select(Some(self.selected));
         }
     }
 
     pub fn select_prev(&mut self) {
         self.selected = self.selected.saturating_sub(1);
+        self.chat_list_state.select(Some(self.selected));
     }
 
     pub fn open_jid(&mut self, jid: String) {
@@ -534,8 +661,8 @@ impl App {
         self.image_message_id = None;
     }
 
-    pub fn message_thumbnail(&self, message_id: &str) -> Option<&DynamicImage> {
-        self.message_thumbnails.get(message_id)
+    pub fn image_protocol(&self, message_id: &str) -> Option<&Protocol> {
+        self.image_protocols.get(message_id)
     }
 
     pub fn thumbnail_loading(&self, message_id: &str) -> bool {
@@ -549,7 +676,7 @@ impl App {
             .rev()
             .filter(|m| {
                 m.is_viewable_image()
-                    && !self.message_thumbnails.contains_key(&m.id)
+                    && !self.image_protocols.contains_key(&m.id)
                     && !self.thumbnail_pending.contains(&m.id)
             })
             .take(limit)
@@ -561,10 +688,10 @@ impl App {
         self.thumbnail_pending.insert(message_id.to_string());
     }
 
-    pub fn set_message_thumbnail(&mut self, message_id: String, image: DynamicImage) {
+    pub fn set_image_protocol(&mut self, message_id: String, protocol: Protocol) {
         self.thumbnail_pending.remove(&message_id);
         if self.messages.iter().any(|m| m.id == message_id) {
-            self.message_thumbnails.insert(message_id, image);
+            self.image_protocols.insert(message_id, protocol);
         }
     }
 
@@ -572,9 +699,9 @@ impl App {
         self.thumbnail_pending.remove(message_id);
     }
 
-    fn prune_message_thumbnails(&mut self) {
+    fn prune_message_media(&mut self) {
         let ids: HashSet<&str> = self.messages.iter().map(|m| m.id.as_str()).collect();
-        self.message_thumbnails
+        self.image_protocols
             .retain(|id, _| ids.contains(id.as_str()));
         self.thumbnail_pending.retain(|id| ids.contains(id.as_str()));
     }
@@ -611,6 +738,29 @@ impl App {
     }
 }
 
+#[cfg(test)]
+mod ack_tests {
+    use super::*;
+
+    #[test]
+    fn ack_precedence_read_over_delivered() {
+        let mut app = App::new();
+        let id = "msg1".to_string();
+        app.apply_message_ack(&[id.clone()], AckLevel::Delivered);
+        app.apply_message_ack(&[id.clone()], AckLevel::Read);
+        assert_eq!(app.message_acks.get(&id), Some(&AckLevel::Read));
+        app.apply_message_ack(&[id], AckLevel::Delivered);
+        assert_eq!(app.message_acks.get("msg1"), Some(&AckLevel::Read));
+    }
+
+    #[test]
+    fn ack_for_pending_message() {
+        let app = App::new();
+        let m = Message::outgoing_pending("hi".to_string(), "me@s.whatsapp.net");
+        assert_eq!(app.ack_for(&m), AckLevel::Pending);
+    }
+}
+
 /// Strip the `@server` suffix from a jid, leaving the bare user part.
 pub fn bare_jid(jid: &str) -> String {
     jid.split('@').next().unwrap_or(jid).to_string()
@@ -627,6 +777,7 @@ fn is_placeholder_group_name(name: &str, jid: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::Device;
 
     #[test]
     fn detects_placeholder_group_name() {
@@ -638,6 +789,28 @@ mod tests {
             "Phoenix IITD",
             "120363416969378279@g.us"
         ));
+    }
+
+    #[test]
+    fn resolves_business_name_over_wrong_chat_name() {
+        let mut app = App::new();
+        app.device = Some(Device {
+            id: String::new(),
+            display_name: "Prashant".to_string(),
+            jid: "917388645941@s.whatsapp.net".to_string(),
+            state: String::new(),
+        });
+        app.push_names.insert(
+            "916366800400@s.whatsapp.net".to_string(),
+            "Acer India".to_string(),
+        );
+        let chat = Chat {
+            jid: "916366800400@s.whatsapp.net".to_string(),
+            name: "Prashant".to_string(),
+            last_message_time: None,
+            archived: false,
+        };
+        assert_eq!(app.chat_display_name(&chat), "Acer India");
     }
 
     #[test]
@@ -689,11 +862,11 @@ mod tests {
         app.active_chats_generation = 2;
 
         // Older generation is ignored.
-        app.set_chats(vec![], 1, false);
+        app.set_chats(vec![], 1, false, HashMap::new());
         assert_eq!(app.chats.len(), 1);
 
         // Wrong archived mode is ignored (e.g. archived fetch after toggle back).
-        app.set_chats(vec![], 3, true);
+        app.set_chats(vec![], 3, true, HashMap::new());
         assert_eq!(app.chats.len(), 1);
 
         app.show_archived = false;
@@ -706,6 +879,7 @@ mod tests {
             }],
             3,
             false,
+            HashMap::new(),
         );
         assert_eq!(app.chats.len(), 1);
         assert_eq!(app.chats[0].jid, "2@s.whatsapp.net");

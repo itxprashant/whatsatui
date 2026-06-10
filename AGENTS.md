@@ -42,7 +42,8 @@ data, or downloaded media (see `.gitignore`).
 | `src/config.rs`           | Env-based configuration with deployment defaults              |
 | `src/archive.rs`          | Archived jids from gateway `whatsmeow_chat_settings`          |
 | `src/media.rs`            | WhatsApp media download/decrypt (chatstorage keys)            |
-| `src/termimg.rs`          | Braille terminal image rendering + inline thumbnail helpers   |
+| `src/termimg.rs`          | Image decode + inline preview cell dimensions (`INLINE_PREVIEW_*`) |
+| `src/terminal.rs`         | Terminal graphics probe (Konsole Sixel re-detect, protocol override) |
 | `src/cache.rs`            | On-disk cache for group subjects (`groups.json`)              |
 | `src/webhook.rs`          | Local `tiny_http` receiver + `verify_signature` (HMAC-SHA256) |
 | `examples/probe.rs`       | Read-only API connectivity probe (no messages sent)           |
@@ -76,6 +77,9 @@ data, or downloaded media (see `.gitignore`).
 - Sending uses optimistic updates: the outgoing message is appended locally
   (with a `pending:` id, see `Message::is_pending`) and reconciled when the
   gateway returns the real message. On failure it is removed via `SendFailed`.
+  Delivery/read ticks (`✓` / `✓✓`) are tracked client-side in
+  `App::message_acks` from `message.ack` webhooks (`receipt_type` delivered/read);
+  the REST message API has no ack field.
 - `get_messages(jid, limit, offset)` returns `MessagesPage` with pagination
   metadata. Initial load uses `MESSAGES_PAGE` (50) at `offset=0`; older pages
   are prepended via `AppEvent::OlderMessages` when the user scrolls up.
@@ -88,18 +92,26 @@ data, or downloaded media (see `.gitignore`).
 - The gateway's `GET /message/:id/download` is unreliable for this deployment;
   images are fetched from the WhatsApp CDN and decrypted locally using keys from
   `chatstorage.db` (`src/media.rs`, whatsmeow-compatible HKDF + AES-CBC).
-- **Inline previews**: after messages load, `maybe_spawn_thumbnails` in
-  `main.rs` fetches up to 8 thumbnails (most recent images first). Decoded
-  images are downscaled via `termimg::thumbnail_image` and cached in
-  `App::message_thumbnails`. `ui.rs` renders them inside bubbles at
-  `INLINE_PREVIEW_COLS` × `INLINE_PREVIEW_ROWS` (22×5 cells) using braille
-  pixels. Captions show below the preview; `[image]` is a fallback only when
-  no preview is cached yet.
-- **Full-screen viewer** (`v` on a picked image): `spawn_image_view` downloads
-  the full image, `Focus::ImageViewer` overlay via `draw_image_overlay`.
-  `[/]` steps `App::media_pick` among viewable images in the open chat.
-- Rendering uses Unicode braille (2×4 px per cell), not half-blocks — see
-  `termimg::render_image`. Preserve sharpness when changing the renderer.
+- **Terminal capability**: at startup `Picker::from_query_stdio()` probes the
+  TTY for Kitty / iTerm2 / Sixel / etc. (`ratatui-image`). `App::native_images`
+  enables the full-screen viewer when the protocol is not `Halfblocks`.
+  `App::native_inline_images` gates scrollable bubble previews (on by default when
+  native graphics are available; set `WHATSATUI_INLINE_IMAGES=0` to disable —
+  useful on Konsole if Sixel ghosts when scrolling).
+- **Inline previews** (`native_inline_images`): `maybe_spawn_thumbnails` in
+  `main.rs` fetches up to 8 thumbnails. Protocols are encoded at
+  `INLINE_PREVIEW_COLS` × `INLINE_PREVIEW_ROWS` (22×5, `Resize::Fit`) — same
+  size as the `Image` widget `Rect`. `ui.rs` overlays images on blank spacer
+  lines; outgoing images align to `bubble_w`. `{spinner} image…` while loading;
+  `[image]` when inline graphics are off or not ready.
+- **Full-screen viewer** (`v`): uses `native_images` (works on Konsole with Sixel
+  enabled). `spawn_image_view` builds a `StatefulProtocol`; `draw_image_overlay`
+  renders via `StatefulImage`. `[/]` steps `App::media_pick`.
+- **Konsole:** `src/terminal.rs` re-probes Sixel when `KONSOLE_VERSION` is set.
+  Enable *Use Sixel graphics* in Konsole settings. Inline previews are on by
+  default; `WHATSATUI_INLINE_IMAGES=0` disables them if scroll artifacts appear.
+  `WHATSATUI_IMAGE_PROTOCOL=sixel` forces the protocol.
+- Unsupported terminals show `[image]` text in bubbles — no braille/halfblock fallback.
 
 ### Chat list
 
@@ -118,6 +130,8 @@ data, or downloaded media (see `.gitignore`).
 ### Contact and group names
 
 - Contact names: `App::contacts` (jid -> name), loaded via `list_contacts()`.
+  Push/business names: `App::push_names` from `whatsmeow_contacts` in
+  `src/contacts_db.rs` (the REST chat `name` is often wrong for business accounts).
 - Group subjects: `App::groups`, loaded via `list_groups()` (`GET /user/my/groups`).
   That endpoint is large (~10 MB), so subjects are persisted in
   `~/.cache/whatsatui/groups.json` (override with `WHATSATUI_CACHE_DIR`) and
@@ -125,7 +139,8 @@ data, or downloaded media (see `.gitignore`).
   refreshes and rewrites the cache via `src/cache.rs`.
 - The chat list often returns placeholder `Group <id>` names for `@g.us` jids.
   Resolution order — groups: group subject -> non-placeholder chat name -> bare
-  jid; individuals: contact name -> chat name -> bare jid (`App::chat_display_name`
+  jid; individuals: whatsmeow push/business name -> contact name -> chat name
+  -> bare jid (`App::chat_display_name`
   / `jid_display_name`). Do name resolution in `app.rs`; `ui.rs` only calls
   these helpers.
 
@@ -138,11 +153,11 @@ data, or downloaded media (see `.gitignore`).
 
 | Context | Keys | Action |
 |---------|------|--------|
-| Chats | `j`/`k`, `Enter`, `/`, `a`, `r`, `q` | Navigate, open, search, archived, refresh, quit |
+| Chats | `j`/`k`, `Enter`, `/`, `a`, `r`, `q` | Switch/open chat, search, archived, refresh, quit |
 | Open chat | `PgUp`/`Home`, `PgDn`/`End` | Scroll / load older messages |
 | Open chat | `[`/`]`, `v` | Pick image, view full-screen |
 | Search | type, `Esc` | Filter, exit |
-| Compose | `Enter`, `Esc`/`Tab` | Send, back to chats |
+| Compose | `Enter`, `Shift+Enter`, `Esc`/`Tab` | Send, newline, back to chats |
 | Image viewer | `Esc`/`v`/`q` | Close viewer |
 | Global | `Ctrl-C` | Quit |
 
@@ -162,6 +177,8 @@ Read from environment variables (defaults match the bundled docker-compose):
 | `WHATSATUI_WHATSMEOW_DB`   | `storages/whatsapp.db`   |
 | `WHATSATUI_CHATSTORAGE_DB` | `storages/chatstorage.db` |
 | `WHATSATUI_CACHE_DIR`      | `~/.cache/whatsatui`     |
+| `WHATSATUI_INLINE_IMAGES`  | _(unset = on; `0`/`false` to disable inline)_ |
+| `WHATSATUI_IMAGE_PROTOCOL` | _(unset; auto-detect)_   |
 
 For live push the gateway must be pointed at the receiver: set
 `WHATSAPP_WEBHOOK=http://localhost:56311/webhook` in `.env` and recreate the
